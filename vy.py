@@ -6,6 +6,8 @@ import sys
 import json
 import tempfile
 
+LOCAL_ROOT = os.path.join(os.environ['HOME'], '.vy')
+
 # todo error handling
 REMOTE_SCRIPT = '''#!/bin/sh
 export PATH=/usr/local/bin:$PATH
@@ -38,11 +40,13 @@ def get_remote_home(host):
 
 
 def setup(args):
-    # echo .svn > .gitignore
-    config = get_config(args.config)
+    config = get_config(args.profile)
+    if config is None:
+        make_profile(args.profile)
+        config = get_config(args.profile)
+
     srv = config['remote-server']
-    # todo more flexible
-    remote_root = os.path.join(get_remote_home(srv), '.vy.remote', os.path.basename(args.config))
+    remote_root = os.path.join(get_remote_home(srv), '.vy.remote', args.profile)
     local_end = config['local-dir']
     remote_end = config['remote-dir']
     repo_filepath = os.path.join(remote_root, 'git-repo')
@@ -71,11 +75,12 @@ def setup(args):
 
     print 'Setup has finished'
 
-
-def config(args):
-    cfg_path = args.file
+def make_profile(name):
+    cfg_path = os.path.join(LOCAL_ROOT, name, 'cfg')
     if os.path.exists(cfg_path):
         raise RuntimeError('Configuration is already set at {}'.format(cfg_path))
+
+    os.makedirs(os.path.join(LOCAL_ROOT, name))
     cfg = {}
     sys.stdout.write('Local directory: ')
     cfg['local-dir'] = os.path.expanduser(sys.stdin.readline().strip())
@@ -91,8 +96,12 @@ def config(args):
     print 'Configuration has been saved to {}'.format(cfg_path)
 
 
-def get_config(path):
+def get_config(profile_name):
     # todo handle path not exist
+    path = os.path.join(LOCAL_ROOT, profile_name, 'cfg')
+    if not os.path.exists(path):
+        return None
+
     with open(path) as input:
         return json.load(input)
 
@@ -103,19 +112,18 @@ def main():
     # TODO more width
     subparsers = parser.add_subparsers(help='List of commands')
 
-    default_cfg_path = os.path.join(os.environ['HOME'], '.vy')
     fmt = argparse.ArgumentDefaultsHelpFormatter
+    help_str = 'profile name'
 
-    config_parser = subparsers.add_parser('config', help='create a configuration file', formatter_class=fmt)
+    '''
+    config_parser = subparsers.add_parser('profile', help='create a configuration file', formatter_class=fmt)
 
-    config_parser.set_defaults(func=config)
-    help_str = 'destination to save configuration'
-    config_parser.add_argument('--file', '-f', help=help_str, default=default_cfg_path, metavar='PATH')
-
+    config_parser.set_defaults(func=profile)
+    config_parser.add_argument('--name', '-n', help=help_str, default='default', metavar='NAME')
+    '''
     setup_parser = subparsers.add_parser('setup', help='create dirs and repositories', formatter_class=fmt)
     setup_parser.set_defaults(func=setup)
-    help_str = 'path to configuration file'
-    setup_parser.add_argument('--config', '-c', help=help_str, default=default_cfg_path, metavar='PATH')
+    setup_parser.add_argument('--profile', '-p', help=help_str, default='default', metavar='NAME')
 
     args = parser.parse_args()
     args.func(args)
