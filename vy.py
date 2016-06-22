@@ -32,19 +32,17 @@ def execute(cmd):
     subprocess.Popen(cmd.split(' ')).communicate()    
 
 
-def setup(args):
-    # remote must exist
-    #os.makedirs(os.path.join(local, 'remote'))
-    # git init
-    # git remote add origin PATH/TO/REPO
-    # git fetch
-    # git checkout -t origin/master
+def get_remote_home(host):
+    stdout, _ = subprocess.Popen('ssh {} pwd'.format(host).split(' '), stdout=subprocess.PIPE).communicate()
+    return stdout.strip()
 
+
+def setup(args):
     # echo .svn > .gitignore
     config = get_config(args.config)
     srv = config['remote-server']
     # todo more flexible
-    remote_root = '/Users/Yura/.vy.remote'
+    remote_root = os.path.join(get_remote_home(srv), '.vy.remote', os.path.basename(args.config))
     local_end = config['local-dir']
     remote_end = config['remote-dir']
     repo_filepath = os.path.join(remote_root, 'git-repo')
@@ -75,14 +73,19 @@ def setup(args):
 
 
 def config(args):
-    home = os.environ['HOME']
-    cfg_path = os.path.join(home, '.vy')
+    cfg_path = args.file
     if os.path.exists(cfg_path):
         raise RuntimeError('Configuration is already set at {}'.format(cfg_path))
     cfg = {}
     sys.stdout.write('Local directory: ')
-    cfg['local'] = sys.stdin.readline().strip()
-    # todo more options
+    cfg['local-dir'] = os.path.expanduser(sys.stdin.readline().strip())
+
+    sys.stdout.write('Remote server: ')
+    cfg['remote-server'] = sys.stdin.readline().strip()
+
+    sys.stdout.write('Remote directory: ')
+    cfg['remote-dir'] = os.path.expanduser(sys.stdin.readline().strip())
+
     with open(cfg_path, 'w+') as out:
         json.dump(cfg, out, indent=2)
     print 'Configuration has been saved to {}'.format(cfg_path)
@@ -101,17 +104,18 @@ def main():
     subparsers = parser.add_subparsers(help='List of commands')
 
     default_cfg_path = os.path.join(os.environ['HOME'], '.vy')
-    config_parser = subparsers.add_parser('config', help='create a configuration file',
-                                          formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    config_parser.add_argument('--file', '-f', help='destination to save configuration',
-                               default=default_cfg_path, metavar='PATH')
-    config_parser.set_defaults(func=config)
+    fmt = argparse.ArgumentDefaultsHelpFormatter
 
-    setup_parser = subparsers.add_parser('setup', help='create dirs and repositories',
-                                         formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    setup_parser.add_argument('--config', '-c', help='path to configuration file', default=default_cfg_path,
-                              metavar='PATH')
+    config_parser = subparsers.add_parser('config', help='create a configuration file', formatter_class=fmt)
+
+    config_parser.set_defaults(func=config)
+    help_str = 'destination to save configuration'
+    config_parser.add_argument('--file', '-f', help=help_str, default=default_cfg_path, metavar='PATH')
+
+    setup_parser = subparsers.add_parser('setup', help='create dirs and repositories', formatter_class=fmt)
     setup_parser.set_defaults(func=setup)
+    help_str = 'path to configuration file'
+    setup_parser.add_argument('--config', '-c', help=help_str, default=default_cfg_path, metavar='PATH')
 
     args = parser.parse_args()
     args.func(args)
