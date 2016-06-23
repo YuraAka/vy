@@ -34,6 +34,7 @@ git --git-dir {root} --work-tree {dir} push --set-upstream origin develop
 # todo use master for sync
 # todo use workflow in setup
 # todo hide .svn: rename .svn
+# todo separate svn logic
 def execute(cmd):
     print cmd
     parts = cmd.split('"')
@@ -61,25 +62,31 @@ class LocalGitWorkflow(object):
             execute(git_cmd)
 
 
-class RemoteGitWorkflow(object):
+class RemoteWorkflow(object):
     def __init__(self, server, work_tree, profile, name):
         self.server = server
         self.work_tree = work_tree
         self.root = os.path.join(get_remote_home(server), '.ru.remote', profile)
         self.git_dir = os.path.join(self.root, '.git')
-        self.commands = []
+        self.commands = ['export PATH=/usr/local/bin:$PATH']
         self.name = name
 
-    def add(self, cmd):
+    def add_git(self, cmd, location=True):
+        if location:
+            git_cmd = 'git --git-dir {} --work-tree {} {}\n'.format(self.git_dir, self.work_tree, cmd)
+        else:
+            git_cmd = 'git {}\n'.format(cmd)
+        self.commands.append(git_cmd)
+
+    def add_sh(self, cmd):
         self.commands.append(cmd)
 
     def execute(self):
         with tempfile.NamedTemporaryFile() as script:
             for cmd in self.commands:
-                git_cmd = 'git --git-dir {} --work-tree {} {}\n'.format(self.git_dir, self.work_tree, cmd)
-                script.write(git_cmd)
+                script.write(cmd + '\n')
             script.file.flush()
-            remote_script = os.path.join(self.root, '{}_remote.sh'.format(self.name))
+            remote_script = os.path.join(self.root, '{}.sh'.format(self.name))
             execute('scp {} {}:{}'.format(script.name, self.server, remote_script))
             execute('ssh {} sh -e {}'.format(self.server, remote_script))
 
@@ -99,27 +106,36 @@ def setup_command(args):
     remote_end = config['remote-dir']
     repo_filepath = os.path.join(remote_root, 'media')
     repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
-    remote_script = os.path.join(remote_root, 'setup_remote.sh')
+    #remote_script = os.path.join(remote_root, 'setup_remote.sh')
     remote_git_dir = os.path.join(remote_root, '.git')
-
-    # remote sync-repo setup
-    script_tmp = tempfile.NamedTemporaryFile()
-    script_tmp.write(REMOTE_SETUP.format(dir=remote_end, repo=repo_filepath, root=remote_git_dir))
-    script_tmp.file.flush()
 
     execute('ssh {} rm -rf {}'.format(srv, remote_root))
     execute('ssh {} mkdir -p {}'.format(srv, repo_filepath))
-    execute('scp {} {}:{}'.format(script_tmp.name, srv, remote_script))
-    execute('ssh {} sh -e {}'.format(srv, remote_script))
+
+    # remote sync-repo setup
+    remote = RemoteWorkflow(srv, remote_end, args.profile, 'setup')
+    remote.add_git('init --bare {}'.format(repo_filepath), location=False)
+    remote.add_git('init')
+    remote.add_git('remote add origin {}'.format(repo_filepath))
+    remote.add_git('add .')
+    remote.add_sh('echo ".svn" >> {}/info/exclude'.format(remote_git_dir))
+    remote.add_sh('rev=$( svn info {} | grep Revision | cut -d" " -f2 )'.format(remote_end)) # todo unlink
+    remote.add_git('commit -m "svn rev $rev"')
+    remote.add_git('fetch --all')
+    remote.add_git('checkout -b develop')
+    remote.add_git('push --set-upstream origin develop')
+    remote.execute()
 
     # local repo setup
+    # todo unify local workflow
     execute('rm -rf {}'.format(local_end))
     execute('mkdir -p {}'.format(local_end))
     execute('git clone {remote} {local}'.format(remote=repo_ssh, local=local_end))
 
-    local_git_dir = os.path.join(local_end, '.git')
-    execute('git --git-dir {} --work-tree {} fetch --all'.format(local_git_dir, local_end))
-    execute('git --git-dir {} --work-tree {} checkout develop'.format(local_git_dir, local_end))
+    local = LocalGitWorkflow(local_end)
+    local.add('fetch --all')
+    local.add('checkout develop')
+    local.execute()
     set_feature_branch(args.profile, DEFAULT_FEATURE)
 
 
@@ -144,12 +160,20 @@ def set_feature_branch(profile, feature):
     new = make_feature_dir(profile, feature)
     local_git = LocalGitWorkflow(config['local-dir'])
     if new:
-        local_git.add('branch {} develop'.format(feature))
-
-    local_git.add('checkout {}'.format(feature))
+        local_git.add('checkout -B {} develop'.format(feature))
+    else:
+        local_git.add('checkout {}'.format(feature))
     local_git.add('clean -fd'.format(feature))
     local_git.add('checkout .'.format(feature))
+    local_git.add('push --set-upstream origin {}'.format(feature))
     local_git.execute()
+
+    remote_git = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
+    remote_git.add_git('fetch --all')
+    remote_git.add_git('checkout -B {0} --track origin/{0}'.format(feature))
+    remote_git.add_git('clean -fd'.format(feature))
+    remote_git.add_git('checkout .'.format(feature))
+    remote_git.execute()
 
     config['feature'] = feature
     save_profile(profile, config)
@@ -163,15 +187,16 @@ def push_command(args):
     local_git.add('checkout {}'.format(feature))
     local_git.add('add .')
     local_git.add('commit -m "{}"'.format(get_commit_message(args.message)))
-    local_git.add('push --set-upstream origin {}'.format(feature))
+    #local_git.add('push --set-upstream origin {}'.format(feature))
+    local_git.add('push')
     local_git.execute()
 
-    remote_git = RemoteGitWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
-    remote_git.add('fetch --all')
-    remote_git.add('checkout -B {0} --track origin/{0}'.format(feature))
-    remote_git.add('clean -fd'.format(feature))
-    remote_git.add('checkout .'.format(feature))
-    remote_git.add('pull')
+    remote_git = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
+    #remote_git.add_git('fetch --all')
+    #remote_git.add_git('checkout -B {0} --track origin/{0}'.format(feature))
+    #remote_git.add_git('clean -fd'.format(feature))
+    #remote_git.add_git('checkout .'.format(feature))
+    remote_git.add_git('pull')
     remote_git.execute()
 
 
