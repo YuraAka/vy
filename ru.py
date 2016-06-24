@@ -96,48 +96,60 @@ class RemoteWorkflow(object):
             execute('ssh {} sh -e {}'.format(self.server, remote_script))
 
 
+class RemoteSubsystem(object):
+    """
+    Describes a nature of remote dir content
+    """
+
+    TYPE = None
+
+    def __init__(self, folder):
+        pass
+
+    def excludes(self, remote, exclude_file):
+        assert False, 'Not implemented'
+
+    def commit_message(self, remote):
+        assert False, 'Not implemented'
+
+
+class RemoteFiles(RemoteSubsystem):
+    TYPE = 'files'
+
+    def __init__(self, folder):
+        super(RemoteFiles, self).__init__(folder)
+
+    def excludes(self, remote, exclude_file):
+        pass
+
+    def commit_message(self, remote):
+        remote.sh('msg="files sync"')
+
+
+class RemoteSvn(RemoteSubsystem):
+    TYPE = 'svn'
+
+    def __init__(self, folder):
+        super(RemoteSvn, self).__init__(folder)
+        self.wc = folder
+
+    def excludes(self, remote, exclude_file):
+        remote.sh('echo ".svn" >> {}'.format(exclude_file))
+
+    def commit_message(self, remote):
+        remote.sh('msg="SVN r$( svn info {} | grep Revision | cut -d" " -f2 )"'.format(self.wc))
+
+
+def get_subsystem(ss_type, folder):
+    for ss in (RemoteFiles, RemoteSvn):
+        if ss.TYPE == ss_type:
+            return ss(folder)
+    raise RuntimeError('Subsystem of type "{}" is not found'.format(ss_type))
+
+
 def get_remote_home(host):
     stdout, _ = subprocess.Popen('ssh {} pwd'.format(host).split(' '), stdout=subprocess.PIPE).communicate()
     return stdout.strip()
-
-
-def setup_command(args):
-    make_profile(args)
-    config = get_config(args.profile)
-
-    srv = config['remote-server']
-    local_end = config['local-dir']
-    remote_end = config['remote-dir']
-
-    # remote sync-repo setup
-    remote = RemoteWorkflow(srv, remote_end, args.profile, 'setup')
-    repo_filepath = os.path.join(remote.root, 'media')
-    remote_git_dir = os.path.join(remote.root, '.git')
-
-    remote.reset()
-    remote.sh('mkdir -p {}'.format(repo_filepath))
-    remote.git('init --bare {}'.format(repo_filepath), location=False)
-    remote.git('init')
-    remote.git('remote add origin {}'.format(repo_filepath))
-    remote.git('add .')
-    remote.sh('echo ".svn" >> {}/info/exclude'.format(remote_git_dir))
-    remote.sh('rev=$( svn info {} | grep Revision | cut -d" " -f2 )'.format(remote_end)) # todo unlink
-    remote.git('commit -m "svn rev $rev"')
-    remote.git('fetch --all')
-    remote.git('checkout -b develop')
-    remote.git('push --set-upstream origin develop')
-    remote.execute()
-
-    # local repo setup
-    local = LocalWorkflow(local_end)
-    local.reset()
-    repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
-
-    local.git('clone {remote} {local}'.format(remote=repo_ssh, local=local_end), location=False)
-    local.git('fetch --all')
-    local.git('checkout develop')
-    local.execute()
-    goto_feature(args.profile, DEFAULT_FEATURE)
 
 
 def get_commit_message(user_msg):
@@ -155,13 +167,56 @@ def make_feature_dir(profile, feature):
     return False
 
 
+def setup_command(args):
+    make_profile(args)
+    config = get_config(args.profile)
+
+    srv = config['remote-server']
+    local_end = config['local-dir']
+    remote_end = config['remote-dir']
+    subsystem = get_subsystem(config['subsystem'], remote_end)
+
+    # remote sync-repo setup
+    remote = RemoteWorkflow(srv, remote_end, args.profile, 'setup')
+    repo_filepath = os.path.join(remote.root, 'media')
+    remote_git_dir = os.path.join(remote.root, '.git')
+
+    remote.reset()
+    remote.sh('mkdir -p {}'.format(repo_filepath))
+    remote.git('init --bare {}'.format(repo_filepath), location=False)
+    remote.git('init')
+    remote.git('remote add origin {}'.format(repo_filepath))
+    remote.git('add .')
+    subsystem.excludes(remote, '{}/info/exclude'.format(remote_git_dir))
+    subsystem.commit_message(remote)
+    remote.git('commit -m "$msg"')
+    remote.git('fetch --all')
+    remote.git('checkout -b develop')
+    remote.git('push --set-upstream origin develop')
+    remote.execute()
+
+    # local repo setup
+    local = LocalWorkflow(local_end)
+    local.reset()
+    repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
+
+    local.git('clone {remote} {local}'.format(remote=repo_ssh, local=local_end), location=False)
+    local.git('fetch --all')
+    local.execute()
+
+    goto_feature(args.profile, DEFAULT_FEATURE)
+
+
+#def goto_git_branch(branch):
+
+
 def goto_feature(profile, feature):
     config = get_config(profile)
 
     new = make_feature_dir(profile, feature)
     local = LocalWorkflow(config['local-dir'])
     if new:
-        local.git('checkout -B {} develop'.format(feature))
+        local.git('checkout -B {} origin/develop'.format(feature))
     else:
         local.git('checkout {}'.format(feature))
     local.git('clean -fd'.format(feature))
@@ -170,6 +225,7 @@ def goto_feature(profile, feature):
     local.execute()
 
     # todo detect manual svn up
+    # todo make conflict resolving if devel is updated
     remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
     remote.git('fetch --all')
     remote.git('checkout -B {0} --track origin/{0}'.format(feature))
@@ -218,6 +274,21 @@ def go_command(args):
     if args.feature != config['feature']:
         goto_feature(args.profile, args.feature)
 
+
+def update_command(args):
+    '''
+    - remote svn revert
+ - remote svn-clean
+ - remote git switch develop
+ - remote svn update
+ - remote git add .
+ - remote git commit
+ - remote git push
+ - local git update develop
+ - local git merge <feature> [optional]
+ - local git switch <local branch> [optional]
+    '''
+    pass
 
 def list_features(profile):
     cfg = get_config(profile)
@@ -283,6 +354,7 @@ def make_profile(args):
     else:
         cfg['remote-dir'] = good_path(args.remote_dir, remote_home)
 
+    cfg['subsystem'] = args.subsystem
     save_config(name, cfg)
     print 'Configuration has been saved to {}'.format(cfg_path)
 
@@ -312,6 +384,8 @@ def main():
     setup_parser.add_argument('--local-dir', help='path to local dir (must not exist)', metavar='PATH')
     setup_parser.add_argument('--remote-server', help='server name or ip', metavar='NAME')
     setup_parser.add_argument('--remote-dir', help='path to remote dir', metavar='PATH')
+    setup_parser.add_argument('--subsystem', choices=['svn', 'files'], help='remote subsystem', metavar='NAME',
+                              default='files')
     setup_parser.set_defaults(func=setup_command)
 
     push_parser = subparsers.add_parser('push', help='push local changes to remote dir', formatter_class=fmt)
