@@ -28,7 +28,7 @@ def execute(cmd):
     p = subprocess.Popen(result)
     p.communicate()
     if p.returncode != 0:
-        raise RuntimeError('ERROR: Invokation of "{}" exists with code {}'.format(cmd, p.returncode))
+        raise RuntimeError('ERROR: "{}" exists with code {}'.format(cmd, p.returncode))
 
 
 class LocalWorkflow(object):
@@ -185,16 +185,32 @@ def push_command(args):
     config = get_config(args.profile)
     feature = config['feature']
 
-    local_git = LocalWorkflow(config['local-dir'])
-    local_git.git('checkout {}'.format(feature))
-    local_git.git('add .')
-    local_git.git('commit -m "{}"'.format(get_commit_message(args.message)))
-    local_git.git('push')
-    local_git.execute()
+    local = LocalWorkflow(config['local-dir'])
+    local.git('checkout {}'.format(feature))
+    local.git('add .')
+    local.git('commit -m "{}" --allow-empty'.format(get_commit_message(args.message)))
+    local.git('push')
+    local.execute()
 
-    remote_git = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
-    remote_git.git('pull')
-    remote_git.execute()
+    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
+    remote.git('pull')
+    remote.execute()
+
+
+def pull_command(args):
+    config = get_config(args.profile)
+    feature = config['feature']
+
+    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'pull')
+    remote.git('add .')
+    remote.git('commit -m "pull" --allow-empty')
+    remote.git('push')
+    remote.execute()
+
+    local = LocalWorkflow(config['local-dir'])
+    local.git('checkout {}'.format(feature))
+    local.git('pull')
+    local.execute()
 
 
 def go_command(args):
@@ -301,6 +317,9 @@ def main():
     push_parser = subparsers.add_parser('push', help='push local changes to remote dir', formatter_class=fmt)
     push_parser.add_argument('--message', '-m', help='push message', metavar='TEXT')
     push_parser.set_defaults(func=push_command)
+
+    pull_parser = subparsers.add_parser('pull', help='pull remote changes to local dir', formatter_class=fmt)
+    pull_parser.set_defaults(func=pull_command)
 
     go_parser = subparsers.add_parser('go', help='go to another feature', formatter_class=fmt)
     go_parser.add_argument('feature', help='feature name', metavar='NAME')
