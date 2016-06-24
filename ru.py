@@ -11,28 +11,9 @@ import shutil
 LOCAL_ROOT = os.path.join(os.environ['HOME'], '.ru')
 DEFAULT_FEATURE = 'noname'
 SETUP_ERROR = RuntimeError('Environment is not set up. Invoke "ru setup"')
-
-# todo error handling
-REMOTE_SETUP = '''#!/bin/sh
-export PATH=/usr/local/bin:$PATH
-
-# init sync repo
-git init --bare {repo}
-
-# link sync repo with svn-wc
-git --git-dir {root} --work-tree {dir} init
-echo '.svn' >> {root}/info/exclude
-git --git-dir {root} --work-tree {dir} remote add origin {repo}
-git --git-dir {root} --work-tree {dir} add .
-rev=$( svn info {dir} | grep Revision | cut -d' ' -f2 )
-git --git-dir {root} --work-tree {dir} commit -m "svn rev $rev"
-git --git-dir {root} --work-tree {dir} fetch --all
-git --git-dir {root} --work-tree {dir} checkout -b develop
-git --git-dir {root} --work-tree {dir} push --set-upstream origin develop
-'''
+REMOTE_ROOT_DIR = '.ru.remote'
 
 # todo use master for sync
-# todo use workflow in setup
 # todo hide .svn: rename .svn
 # todo separate svn logic
 def execute(cmd):
@@ -44,49 +25,73 @@ def execute(cmd):
         if i+1 < len(parts):
             result += [parts[i+1]]
 
-    subprocess.Popen(result).communicate()
+    p = subprocess.Popen(result)
+    p.communicate()
+    if p.returncode != 0:
+        raise RuntimeError('ERROR: Invokation of "{}" exists with code {}'.format(cmd, p.returncode))
 
 
-class LocalGitWorkflow(object):
+class LocalWorkflow(object):
     def __init__(self, repo_dir):
         self.git_dir = os.path.join(repo_dir, '.git')
         self.work_tree = repo_dir
         self.commands = []
 
-    def add(self, cmd):
+    def reset(self):
+        self.sh('rm -rf {}'.format(self.work_tree))
+        self.sh('mkdir -p {}'.format(self.work_tree))
+
+    def git(self, cmd, location=True):
+        if location:
+            git_cmd = 'git --git-dir {} --work-tree {} {}'.format(self.git_dir, self.work_tree, cmd)
+        else:
+            git_cmd = 'git {}'.format(cmd)
+        self.commands.append(git_cmd)
+
+    def sh(self, cmd):
         self.commands.append(cmd)
 
     def execute(self):
         for cmd in self.commands:
-            git_cmd = 'git --git-dir {} --work-tree {} {}'.format(self.git_dir, self.work_tree, cmd)
-            execute(git_cmd)
+            execute(cmd)
 
 
 class RemoteWorkflow(object):
+    @property
+    def root(self):
+        return self.__root
+
     def __init__(self, server, work_tree, profile, name):
         self.server = server
         self.work_tree = work_tree
-        self.root = os.path.join(get_remote_home(server), '.ru.remote', profile)
-        self.git_dir = os.path.join(self.root, '.git')
+        self.__root = os.path.join(get_remote_home(server), REMOTE_ROOT_DIR, profile)
+        self.git_dir = os.path.join(self.__root, '.git')
         self.commands = ['export PATH=/usr/local/bin:$PATH']
         self.name = name
 
-    def add_git(self, cmd, location=True):
+    def reset(self):
+        execute('ssh {} rm -rf {}'.format(self.server, self.__root))
+        execute('ssh {} mkdir -p {}'.format(self.server, self.__root))
+
+    def git(self, cmd, location=True):
         if location:
-            git_cmd = 'git --git-dir {} --work-tree {} {}\n'.format(self.git_dir, self.work_tree, cmd)
+            git_cmd = 'git --git-dir {} --work-tree {} {}'.format(self.git_dir, self.work_tree, cmd)
         else:
-            git_cmd = 'git {}\n'.format(cmd)
+            git_cmd = 'git {}'.format(cmd)
+
         self.commands.append(git_cmd)
 
-    def add_sh(self, cmd):
+    def sh(self, cmd):
         self.commands.append(cmd)
 
     def execute(self):
         with tempfile.NamedTemporaryFile() as script:
+            script.write('set -e\n')
             for cmd in self.commands:
+                script.write('echo {}\n'.format(cmd))
                 script.write(cmd + '\n')
             script.file.flush()
-            remote_script = os.path.join(self.root, '{}.sh'.format(self.name))
+            remote_script = os.path.join(self.__root, '{}.sh'.format(self.name))
             execute('scp {} {}:{}'.format(script.name, self.server, remote_script))
             execute('ssh {} sh -e {}'.format(self.server, remote_script))
 
@@ -97,46 +102,42 @@ def get_remote_home(host):
 
 
 def setup_command(args):
-    make_profile(args.profile)
+    make_profile(args)
     config = get_config(args.profile)
 
     srv = config['remote-server']
-    remote_root = os.path.join(get_remote_home(srv), '.ru.remote', args.profile)
     local_end = config['local-dir']
     remote_end = config['remote-dir']
-    repo_filepath = os.path.join(remote_root, 'media')
-    repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
-    #remote_script = os.path.join(remote_root, 'setup_remote.sh')
-    remote_git_dir = os.path.join(remote_root, '.git')
-
-    execute('ssh {} rm -rf {}'.format(srv, remote_root))
-    execute('ssh {} mkdir -p {}'.format(srv, repo_filepath))
 
     # remote sync-repo setup
     remote = RemoteWorkflow(srv, remote_end, args.profile, 'setup')
-    remote.add_git('init --bare {}'.format(repo_filepath), location=False)
-    remote.add_git('init')
-    remote.add_git('remote add origin {}'.format(repo_filepath))
-    remote.add_git('add .')
-    remote.add_sh('echo ".svn" >> {}/info/exclude'.format(remote_git_dir))
-    remote.add_sh('rev=$( svn info {} | grep Revision | cut -d" " -f2 )'.format(remote_end)) # todo unlink
-    remote.add_git('commit -m "svn rev $rev"')
-    remote.add_git('fetch --all')
-    remote.add_git('checkout -b develop')
-    remote.add_git('push --set-upstream origin develop')
+    repo_filepath = os.path.join(remote.root, 'media')
+    remote_git_dir = os.path.join(remote.root, '.git')
+
+    remote.reset()
+    remote.sh('mkdir -p {}'.format(repo_filepath))
+    remote.git('init --bare {}'.format(repo_filepath), location=False)
+    remote.git('init')
+    remote.git('remote add origin {}'.format(repo_filepath))
+    remote.git('add .')
+    remote.sh('echo ".svn" >> {}/info/exclude'.format(remote_git_dir))
+    remote.sh('rev=$( svn info {} | grep Revision | cut -d" " -f2 )'.format(remote_end)) # todo unlink
+    remote.git('commit -m "svn rev $rev"')
+    remote.git('fetch --all')
+    remote.git('checkout -b develop')
+    remote.git('push --set-upstream origin develop')
     remote.execute()
 
     # local repo setup
-    # todo unify local workflow
-    execute('rm -rf {}'.format(local_end))
-    execute('mkdir -p {}'.format(local_end))
-    execute('git clone {remote} {local}'.format(remote=repo_ssh, local=local_end))
+    local = LocalWorkflow(local_end)
+    local.reset()
+    repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
 
-    local = LocalGitWorkflow(local_end)
-    local.add('fetch --all')
-    local.add('checkout develop')
+    local.git('clone {remote} {local}'.format(remote=repo_ssh, local=local_end), location=False)
+    local.git('fetch --all')
+    local.git('checkout develop')
     local.execute()
-    set_feature_branch(args.profile, DEFAULT_FEATURE)
+    goto_feature(args.profile, DEFAULT_FEATURE)
 
 
 def get_commit_message(user_msg):
@@ -154,56 +155,52 @@ def make_feature_dir(profile, feature):
     return False
 
 
-def set_feature_branch(profile, feature):
+def goto_feature(profile, feature):
     config = get_config(profile)
 
     new = make_feature_dir(profile, feature)
-    local_git = LocalGitWorkflow(config['local-dir'])
+    local = LocalWorkflow(config['local-dir'])
     if new:
-        local_git.add('checkout -B {} develop'.format(feature))
+        local.git('checkout -B {} develop'.format(feature))
     else:
-        local_git.add('checkout {}'.format(feature))
-    local_git.add('clean -fd'.format(feature))
-    local_git.add('checkout .'.format(feature))
-    local_git.add('push --set-upstream origin {}'.format(feature))
-    local_git.execute()
+        local.git('checkout {}'.format(feature))
+    local.git('clean -fd'.format(feature))
+    local.git('checkout .'.format(feature))
+    local.git('push --set-upstream origin {}'.format(feature))
+    local.execute()
 
-    remote_git = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
-    remote_git.add_git('fetch --all')
-    remote_git.add_git('checkout -B {0} --track origin/{0}'.format(feature))
-    remote_git.add_git('clean -fd'.format(feature))
-    remote_git.add_git('checkout .'.format(feature))
-    remote_git.execute()
+    # todo detect manual svn up
+    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
+    remote.git('fetch --all')
+    remote.git('checkout -B {0} --track origin/{0}'.format(feature))
+    remote.git('clean -fd'.format(feature))
+    remote.git('checkout .'.format(feature))
+    remote.execute()
 
     config['feature'] = feature
-    save_profile(profile, config)
+    save_config(profile, config)
 
 
 def push_command(args):
     config = get_config(args.profile)
     feature = config['feature']
 
-    local_git = LocalGitWorkflow(config['local-dir'])
-    local_git.add('checkout {}'.format(feature))
-    local_git.add('add .')
-    local_git.add('commit -m "{}"'.format(get_commit_message(args.message)))
-    #local_git.add('push --set-upstream origin {}'.format(feature))
-    local_git.add('push')
+    local_git = LocalWorkflow(config['local-dir'])
+    local_git.git('checkout {}'.format(feature))
+    local_git.git('add .')
+    local_git.git('commit -m "{}"'.format(get_commit_message(args.message)))
+    local_git.git('push')
     local_git.execute()
 
     remote_git = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
-    #remote_git.add_git('fetch --all')
-    #remote_git.add_git('checkout -B {0} --track origin/{0}'.format(feature))
-    #remote_git.add_git('clean -fd'.format(feature))
-    #remote_git.add_git('checkout .'.format(feature))
-    remote_git.add_git('pull')
+    remote_git.git('pull')
     remote_git.execute()
 
 
 def go_command(args):
     config = get_config(args.profile)
     if args.feature != config['feature']:
-        set_feature_branch(args.profile, args.feature)
+        goto_feature(args.profile, args.feature)
 
 
 def list_features(profile):
@@ -237,30 +234,40 @@ def good_path(path, home=None):
     return os.path.abspath(path)
 
 
-def save_profile(name, cfg):
+def save_config(name, cfg):
     cfg_path = os.path.join(LOCAL_ROOT, name, 'cfg')
     with open(cfg_path, 'w+') as out:
         json.dump(cfg, out, indent=2)
 
 
-def make_profile(name):
+def make_profile(args):
+    name = args.profile
     profile_path = os.path.join(LOCAL_ROOT, name)
     cfg_path = os.path.join(profile_path, 'cfg')
     shutil.rmtree(profile_path, ignore_errors=True)
 
     os.makedirs(profile_path)
     cfg = {}
-    sys.stdout.write('Local directory: ')
-    cfg['local-dir'] = good_path(sys.stdin.readline().strip())
+    if args.local_dir is None:
+        sys.stdout.write('Local directory: ')
+        cfg['local-dir'] = good_path(sys.stdin.readline().strip())
+    else:
+        cfg['local-dir'] = good_path(args.local_dir)
 
-    sys.stdout.write('Remote server: ')
-    cfg['remote-server'] = sys.stdin.readline().strip()
+    if args.remote_server is None:
+        sys.stdout.write('Remote server: ')
+        cfg['remote-server'] = sys.stdin.readline().strip()
+    else:
+        cfg['remote-server'] = args.remote_server
 
-    sys.stdout.write('Remote directory: ')
     remote_home = get_remote_home(cfg['remote-server'])
-    cfg['remote-dir'] = good_path(sys.stdin.readline().strip(), remote_home)
+    if args.remote_dir is None:
+        sys.stdout.write('Remote directory: ')
+        cfg['remote-dir'] = good_path(sys.stdin.readline().strip(), remote_home)
+    else:
+        cfg['remote-dir'] = good_path(args.remote_dir, remote_home)
 
-    save_profile(name, cfg)
+    save_config(name, cfg)
     print 'Configuration has been saved to {}'.format(cfg_path)
 
 
@@ -286,6 +293,9 @@ def main():
     fmt = argparse.ArgumentDefaultsHelpFormatter
 
     setup_parser = subparsers.add_parser('setup', help='create dirs and repositories', formatter_class=fmt)
+    setup_parser.add_argument('--local-dir', help='path to local dir (must not exist)', metavar='PATH')
+    setup_parser.add_argument('--remote-server', help='server name or ip', metavar='NAME')
+    setup_parser.add_argument('--remote-dir', help='path to remote dir', metavar='PATH')
     setup_parser.set_defaults(func=setup_command)
 
     push_parser = subparsers.add_parser('push', help='push local changes to remote dir', formatter_class=fmt)
