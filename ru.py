@@ -12,6 +12,7 @@ LOCAL_ROOT = os.path.join(os.environ['HOME'], '.ru')
 DEFAULT_FEATURE = 'noname'
 SETUP_ERROR = RuntimeError('Environment is not set up. Invoke "ru setup"')
 REMOTE_ROOT_DIR = '.ru.remote'
+MAINSTREAM_BRANCH = 'mainstream'
 
 # todo use master for sync
 # todo hide .svn: rename .svn
@@ -88,7 +89,7 @@ class RemoteWorkflow(object):
         with tempfile.NamedTemporaryFile() as script:
             script.write('set -e\n')
             for cmd in self.commands:
-                script.write('echo {}\n'.format(cmd))
+                script.write('echo "{}"\n'.format(cmd))
                 script.write(cmd + '\n')
             script.file.flush()
             remote_script = os.path.join(self.__root, '{}.sh'.format(self.name))
@@ -112,6 +113,9 @@ class RemoteSubsystem(object):
     def commit_message(self, remote):
         assert False, 'Not implemented'
 
+    def update_mainstream(self, remote):
+        assert False, 'Not implemented'
+
 
 class RemoteFiles(RemoteSubsystem):
     TYPE = 'files'
@@ -125,6 +129,9 @@ class RemoteFiles(RemoteSubsystem):
     def commit_message(self, remote):
         remote.sh('msg="files sync"')
 
+    def update_mainstream(self, remote):
+        pass
+
 
 class RemoteSvn(RemoteSubsystem):
     TYPE = 'svn'
@@ -134,10 +141,13 @@ class RemoteSvn(RemoteSubsystem):
         self.wc = folder
 
     def excludes(self, remote, exclude_file):
-        remote.sh('echo ".svn" >> {}'.format(exclude_file))
+        remote.sh('echo .svn >> {}'.format(exclude_file))
 
     def commit_message(self, remote):
         remote.sh('msg="SVN r$( svn info {} | grep Revision | cut -d" " -f2 )"'.format(self.wc))
+
+    def update_mainstream(self, remote):
+        remote.sh('svn up {}'.format(self.wc))
 
 
 def get_subsystem(ss_type, folder):
@@ -185,14 +195,14 @@ def setup_command(args):
     remote.sh('mkdir -p {}'.format(repo_filepath))
     remote.git('init --bare {}'.format(repo_filepath), location=False)
     remote.git('init')
-    remote.git('remote add origin {}'.format(repo_filepath))
-    remote.git('add .')
     subsystem.excludes(remote, '{}/info/exclude'.format(remote_git_dir))
     subsystem.commit_message(remote)
+    remote.git('remote add origin {}'.format(repo_filepath))
+    remote.git('add .')
     remote.git('commit -m "$msg"')
     remote.git('fetch --all')
-    remote.git('checkout -b develop')
-    remote.git('push --set-upstream origin develop')
+    remote.git('checkout -b {}'.format(MAINSTREAM_BRANCH))
+    remote.git('push --set-upstream origin {}'.format(MAINSTREAM_BRANCH))
     remote.execute()
 
     # local repo setup
@@ -207,7 +217,13 @@ def setup_command(args):
     goto_feature(args.profile, DEFAULT_FEATURE)
 
 
-#def goto_git_branch(branch):
+def goto_git_branch_remote(config, profile, branch):
+    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
+    remote.git('fetch --all')
+    remote.git('checkout -B {0} --track origin/{0}'.format(branch))
+    remote.git('clean -fd'.format(branch)) # todo find out is it obligatory? seems checkout <feature> do the job
+    remote.git('checkout .'.format(branch))
+    remote.execute()
 
 
 def goto_feature(profile, feature):
@@ -215,23 +231,22 @@ def goto_feature(profile, feature):
 
     new = make_feature_dir(profile, feature)
     local = LocalWorkflow(config['local-dir'])
+    local.git('fetch --all')
     if new:
-        local.git('checkout -B {} origin/develop'.format(feature))
+        local.git('checkout -B {} origin/{}'.format(feature, MAINSTREAM_BRANCH))
     else:
         local.git('checkout {}'.format(feature))
     local.git('clean -fd'.format(feature))
     local.git('checkout .'.format(feature))
-    local.git('push --set-upstream origin {}'.format(feature))
+
+    if not new:
+        local.git('merge origin/{0} -m "Merge {0}"'.format(MAINSTREAM_BRANCH))
+    local.git('push --set-upstream origin {}'.format(feature)) # todo try remove it
     local.execute()
 
     # todo detect manual svn up
     # todo make conflict resolving if devel is updated
-    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
-    remote.git('fetch --all')
-    remote.git('checkout -B {0} --track origin/{0}'.format(feature))
-    remote.git('clean -fd'.format(feature))
-    remote.git('checkout .'.format(feature))
-    remote.execute()
+    goto_git_branch_remote(config, profile, feature)
 
     config['feature'] = feature
     save_config(profile, config)
@@ -276,19 +291,20 @@ def go_command(args):
 
 
 def update_command(args):
-    '''
-    - remote svn revert
- - remote svn-clean
- - remote git switch develop
- - remote svn update
- - remote git add .
- - remote git commit
- - remote git push
- - local git update develop
- - local git merge <feature> [optional]
- - local git switch <local branch> [optional]
-    '''
-    pass
+    config = get_config(args.profile)
+    subsystem = get_subsystem(config['subsystem'], config['remote-dir'])
+    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'pull')
+
+    goto_git_branch_remote(config, args.profile, MAINSTREAM_BRANCH)
+    subsystem.update_mainstream(remote)
+    remote.git('add .')
+    subsystem.commit_message(remote)
+    remote.git('commit -m "$msg"  --allow-empty')
+    remote.git('push')
+    remote.execute()
+
+    goto_feature(args.profile, config['feature'])
+
 
 def list_features(profile):
     cfg = get_config(profile)
@@ -402,6 +418,9 @@ def main():
     ls_parser = subparsers.add_parser('ls', help='list features & profiles', formatter_class=fmt)
     ls_parser.add_argument('--all', '-a', help='list profiles and features', action='store_true')
     ls_parser.set_defaults(func=ls_command)
+
+    update_parser = subparsers.add_parser('update', help='update mainstream', formatter_class=fmt)
+    update_parser.set_defaults(func=update_command)
 
     args = parser.parse_args()
     args.func(args)
