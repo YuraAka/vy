@@ -17,6 +17,9 @@ MAINSTREAM_BRANCH = 'mainstream'
 # todo use master for sync
 # todo hide .svn: rename .svn
 # todo separate svn logic
+# todo how to be if user wants to svn up to older revision
+
+# todo idea: no mainstream, only features, manual svn up, manual svn conflict resolution
 def execute(cmd):
     print cmd
     parts = cmd.split('"')
@@ -285,9 +288,8 @@ def pull_command(args):
 
 
 def go_command(args):
-    config = get_config(args.profile)
-    if args.feature != config['feature']:
-        goto_feature(args.profile, args.feature)
+    #config = get_config(args.profile)
+    goto_feature(args.profile, args.feature)
 
 
 def update_command(args):
