@@ -8,11 +8,10 @@ import tempfile
 import datetime
 import shutil
 
-LOCAL_ROOT = os.path.join(os.environ['HOME'], '.ru')
-DEFAULT_FEATURE = 'noname'
-SETUP_ERROR = RuntimeError('Environment is not set up. Invoke "ru setup"')
-REMOTE_ROOT_DIR = '.ru.remote'
-MAINSTREAM_BRANCH = 'mainstream'
+LOCAL_ROOT = os.path.join(os.environ['HOME'], '.gru_local')
+SETUP_ERROR = RuntimeError('Environment is not set up. Invoke "gru setup"')
+REMOTE_ROOT_DIR = '.gru_remote'
+SYNC_BRANCH = 'master'
 
 # todo use master for sync
 # todo hide .svn: rename .svn
@@ -165,169 +164,11 @@ def get_remote_home(host):
     return stdout.strip()
 
 
-def get_commit_message(user_msg):
+def get_timestamp_message(user_msg):
     msg = datetime.datetime.now().strftime("%d.%m.%Y %H:%M%:%S")
     if user_msg:
         msg += ' ({})'.format(user_msg)
     return msg
-
-
-def make_feature_dir(profile, feature):
-    feature_dir = os.path.join(LOCAL_ROOT, profile, feature)
-    if not os.path.exists(feature_dir):
-        os.makedirs(feature_dir)
-        return True
-    return False
-
-
-def setup_command(args):
-    make_profile(args)
-    config = get_config(args.profile)
-
-    srv = config['remote-server']
-    local_end = config['local-dir']
-    remote_end = config['remote-dir']
-    subsystem = get_subsystem(config['subsystem'], remote_end)
-
-    # remote sync-repo setup
-    remote = RemoteWorkflow(srv, remote_end, args.profile, 'setup')
-    repo_filepath = os.path.join(remote.root, 'media')
-    remote_git_dir = os.path.join(remote.root, '.git')
-
-    remote.reset()
-    remote.sh('mkdir -p {}'.format(repo_filepath))
-    remote.git('init --bare {}'.format(repo_filepath), location=False)
-    remote.git('init')
-    subsystem.excludes(remote, '{}/info/exclude'.format(remote_git_dir))
-    subsystem.commit_message(remote)
-    remote.git('remote add origin {}'.format(repo_filepath))
-    remote.git('add .')
-    remote.git('commit -m "$msg"')
-    remote.git('fetch --all')
-    remote.git('checkout -b {}'.format(MAINSTREAM_BRANCH))
-    remote.git('push --set-upstream origin {}'.format(MAINSTREAM_BRANCH))
-    remote.execute()
-
-    # local repo setup
-    local = LocalWorkflow(local_end)
-    local.reset()
-    repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
-
-    local.git('clone {remote} {local}'.format(remote=repo_ssh, local=local_end), location=False)
-    local.git('fetch --all')
-    local.execute()
-
-    goto_feature(args.profile, DEFAULT_FEATURE)
-
-
-def goto_git_branch_remote(config, profile, branch):
-    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], profile, 'go')
-    remote.git('fetch --all')
-    remote.git('checkout -B {0} --track origin/{0}'.format(branch))
-    remote.git('clean -fd'.format(branch)) # todo find out is it obligatory? seems checkout <feature> do the job
-    remote.git('checkout .'.format(branch))
-    remote.execute()
-
-
-def goto_feature(profile, feature):
-    config = get_config(profile)
-
-    new = make_feature_dir(profile, feature)
-    local = LocalWorkflow(config['local-dir'])
-    local.git('fetch --all')
-    if new:
-        local.git('checkout -B {} origin/{}'.format(feature, MAINSTREAM_BRANCH))
-    else:
-        local.git('checkout {}'.format(feature))
-    local.git('clean -fd'.format(feature))
-    local.git('checkout .'.format(feature))
-
-    if not new:
-        local.git('merge origin/{0} -m "Merge {0}"'.format(MAINSTREAM_BRANCH))
-    local.git('push --set-upstream origin {}'.format(feature)) # todo try remove it
-    local.execute()
-
-    # todo detect manual svn up
-    # todo make conflict resolving if devel is updated
-    goto_git_branch_remote(config, profile, feature)
-
-    config['feature'] = feature
-    save_config(profile, config)
-
-
-def push_command(args):
-    config = get_config(args.profile)
-    feature = config['feature']
-
-    local = LocalWorkflow(config['local-dir'])
-    local.git('checkout {}'.format(feature))
-    local.git('add .')
-    local.git('commit -m "{}" --allow-empty'.format(get_commit_message(args.message)))
-    local.git('push')
-    local.execute()
-
-    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
-    remote.git('pull')
-    remote.execute()
-
-
-def pull_command(args):
-    config = get_config(args.profile)
-    feature = config['feature']
-
-    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'pull')
-    remote.git('add .')
-    remote.git('commit -m "pull" --allow-empty')
-    remote.git('push')
-    remote.execute()
-
-    local = LocalWorkflow(config['local-dir'])
-    local.git('checkout {}'.format(feature))
-    local.git('pull')
-    local.execute()
-
-
-def go_command(args):
-    #config = get_config(args.profile)
-    goto_feature(args.profile, args.feature)
-
-
-def update_command(args):
-    config = get_config(args.profile)
-    subsystem = get_subsystem(config['subsystem'], config['remote-dir'])
-    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'pull')
-
-    goto_git_branch_remote(config, args.profile, MAINSTREAM_BRANCH)
-    subsystem.update_mainstream(remote)
-    remote.git('add .')
-    subsystem.commit_message(remote)
-    remote.git('commit -m "$msg"  --allow-empty')
-    remote.git('push')
-    remote.execute()
-
-    goto_feature(args.profile, config['feature'])
-
-
-def list_features(profile):
-    cfg = get_config(profile)
-    features = next(os.walk(os.path.join(LOCAL_ROOT, profile)))[1]
-    print 'Features of profile "{}":'.format(profile)
-    for feature in features:
-        if feature == cfg['feature']:
-            print '* ' + feature
-        else:
-            print '  ' + feature
-
-
-def ls_command(args):
-    if not os.path.exists(LOCAL_ROOT):
-        raise SETUP_ERROR
-
-    if args.all:
-        for profile in os.listdir(LOCAL_ROOT):
-            list_features(profile)
-    else:
-        list_features(args.profile)
 
 
 def good_path(path, home=None):
@@ -389,6 +230,103 @@ def get_config(profile_name, fail=True):
         return json.load(input)
 
 
+def setup_command(args):
+    make_profile(args)
+    config = get_config(args.profile)
+
+    srv = config['remote-server']
+    local_end = config['local-dir']
+    remote_end = config['remote-dir']
+    subsystem = get_subsystem(config['subsystem'], remote_end)
+
+    # remote sync-repo setup
+    remote = RemoteWorkflow(srv, remote_end, args.profile, 'setup')
+    repo_filepath = os.path.join(remote.root, 'media')
+    remote_git_dir = os.path.join(remote.root, '.git')
+
+    remote.reset()
+    remote.sh('mkdir -p {}'.format(repo_filepath))
+    remote.git('init --bare {}'.format(repo_filepath), location=False)
+    remote.git('init')
+    subsystem.excludes(remote, '{}/info/exclude'.format(remote_git_dir))
+    subsystem.commit_message(remote)
+    remote.git('remote add origin {}'.format(repo_filepath))
+    remote.git('fetch --all')
+    remote.git('checkout -B {}'.format(SYNC_BRANCH))
+    remote.git('add .')
+    remote.git('commit -m "[remote] $msg"')
+    remote.git('push --set-upstream origin {}'.format(SYNC_BRANCH))
+    remote.execute()
+
+    # local repo setup
+    local = LocalWorkflow(local_end)
+    local.reset()
+    repo_ssh = 'ssh://{host}{path}'.format(host=srv, path=repo_filepath)
+
+    local.git('clone {remote} {local}'.format(remote=repo_ssh, local=local_end), location=False)
+    local.git('fetch --all')
+    local.git('checkout -B {0}'.format(SYNC_BRANCH))
+    local.git('branch --set-upstream-to=origin/{0} {0}'.format(SYNC_BRANCH))
+    local.git('pull')
+    local.execute()
+
+# todo hide .git from work copy
+def push_command(args):
+    config = get_config(args.profile)
+
+    # bring potential conflicts on local side
+    remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
+    remote.git('add .')
+    msg = 'save potentially overwritten changes'
+    remote.git('commit -m "[remote] {}" --allow-empty'.format(get_timestamp_message(msg)))
+    remote.git('push')
+    remote.execute()
+
+    local = LocalWorkflow(config['local-dir'])
+    local.git('add .')
+    local.git('commit -m "[local] {}" --allow-empty'.format(get_timestamp_message(args.message)))
+    local.git('pull')
+    local.git('push')
+    local.execute()
+
+    remote.git('pull')
+    remote.execute()
+
+"""
+local edit
+remote svn up
+gru pull
+conflicts??? -- make user to resolve it
+
+local edit
+remote svn up
+gru push
+conflicts??? (remote conflicts -- worse)
+
+right way:
+1. local edit
+2. gru push
+3. remote svn up
+4. gru pull
+"""
+def pull_command(args):
+    config = get_config(args.profile)
+
+    srv, remote_dir = config['remote-server'], config['remote-dir']
+    remote = RemoteWorkflow(srv, remote_dir, args.profile, 'pull')
+    remote.git('add .')
+    remote.git('commit -m "update from {}:{}" --allow-empty'.format(srv, remote_dir))
+    remote.git('push')
+    remote.execute()
+
+    local = LocalWorkflow(config['local-dir'])
+    local.git('add .')
+    msg = get_timestamp_message('save potentially overwritten changes')
+    local.git('commit -m "[local] {}" --allow-empty'.format(msg))
+    local.git('pull')
+    local.execute()
+
+
 def main():
     parser = argparse.ArgumentParser()
 
@@ -412,17 +350,6 @@ def main():
 
     pull_parser = subparsers.add_parser('pull', help='pull remote changes to local dir', formatter_class=fmt)
     pull_parser.set_defaults(func=pull_command)
-
-    go_parser = subparsers.add_parser('go', help='go to another feature', formatter_class=fmt)
-    go_parser.add_argument('feature', help='feature name', metavar='NAME')
-    go_parser.set_defaults(func=go_command)
-
-    ls_parser = subparsers.add_parser('ls', help='list features & profiles', formatter_class=fmt)
-    ls_parser.add_argument('--all', '-a', help='list profiles and features', action='store_true')
-    ls_parser.set_defaults(func=ls_command)
-
-    update_parser = subparsers.add_parser('update', help='update mainstream', formatter_class=fmt)
-    update_parser.set_defaults(func=update_command)
 
     args = parser.parse_args()
     args.func(args)
