@@ -17,9 +17,8 @@ SYNC_BRANCH = 'master'
 # todo hide .svn: rename .svn
 # todo separate svn logic
 # todo how to be if user wants to svn up to older revision
-
-# todo idea: no mainstream, only features, manual svn up, manual svn conflict resolution
-def execute(cmd):
+# todo autorun tool on conflicts
+def execute(cmd, throw=True):
     print cmd
     parts = cmd.split('"')
     result = []
@@ -31,10 +30,41 @@ def execute(cmd):
     p = subprocess.Popen(result)
     p.communicate()
     if p.returncode != 0:
-        raise RuntimeError('ERROR: "{}" exists with code {}'.format(cmd, p.returncode))
+        error = RuntimeError('ERROR: "{}" exists with code {}'.format(cmd, p.returncode))
+        if throw is True:
+            raise error
+        print error
+        return error
+    return None
+
+
+class LocalCommand(object):
+    def __init__(self, cmd, wf, workdir=None, ignore_fail=False):
+        self.__cmd = cmd
+        self.on_fail = wf
+        self.__workdir = workdir
+        self.__ignore_fail = ignore_fail
+
+    def execute(self, **kwargs):
+        if self.__workdir:
+            cwd = os.getcwd()
+            execute('cd {}'.format(self.__workdir))
+        try:
+            if self.__ignore_fail:
+                error = execute(self.__cmd, throw=False)
+                print error
+                return None
+            return execute(self.__cmd, **kwargs)
+        finally:
+            if self.__workdir:
+                execute('cd {}'.format(cwd))
 
 
 class LocalWorkflow(object):
+    @property
+    def empty(self):
+        return len(self.commands) == 0
+
     def __init__(self, repo_dir):
         self.git_dir = os.path.join(repo_dir, '.git')
         self.work_tree = repo_dir
@@ -44,19 +74,43 @@ class LocalWorkflow(object):
         self.sh('rm -rf {}'.format(self.work_tree))
         self.sh('mkdir -p {}'.format(self.work_tree))
 
-    def git(self, cmd, location=True):
+    def git(self, cmd, location=True, workdir=None, ignore_fail=False):
         if location:
             git_cmd = 'git --git-dir {} --work-tree {} {}'.format(self.git_dir, self.work_tree, cmd)
         else:
             git_cmd = 'git {}'.format(cmd)
-        self.commands.append(git_cmd)
+        self.commands.append(LocalCommand(
+            cmd=git_cmd,
+            wf=LocalWorkflow(self.work_tree),
+            workdir=workdir,
+            ignore_fail=ignore_fail
+        ))
+        return self.commands[-1]
 
-    def sh(self, cmd):
-        self.commands.append(cmd)
+    def sh(self, cmd, workdir=None):
+        self.commands.append(LocalCommand(cmd, LocalWorkflow(self.work_tree), workdir))
+        return self.commands[-1]
 
     def execute(self):
         for cmd in self.commands:
-            execute(cmd)
+            error = cmd.execute(throw=False)
+            if error is not None:
+                if cmd.on_fail.empty:
+                    raise error
+                cmd.on_fail.execute()
+
+
+class RemoteCommand(object):
+    @property
+    def ignore_fail(self):
+        return self.__ignore_fail
+
+    def __init__(self, cmd, ignore_fail=False):
+        self.__cmd = cmd
+        self.__ignore_fail = ignore_fail
+
+    def __str__(self):
+        return self.__cmd
 
 
 class RemoteWorkflow(object):
@@ -69,30 +123,35 @@ class RemoteWorkflow(object):
         self.work_tree = work_tree
         self.__root = os.path.join(get_remote_home(server), REMOTE_ROOT_DIR, profile)
         self.git_dir = os.path.join(self.__root, '.git')
-        self.commands = ['export PATH=/usr/local/bin:$PATH']
+        self.commands = [RemoteCommand('export PATH=/usr/local/bin:$PATH')]
         self.name = name
 
     def reset(self):
         execute('ssh {} rm -rf {}'.format(self.server, self.__root))
         execute('ssh {} mkdir -p {}'.format(self.server, self.__root))
 
-    def git(self, cmd, location=True):
+    def git(self, cmd, location=True, ignore_fail=False):
         if location:
             git_cmd = 'git --git-dir {} --work-tree {} {}'.format(self.git_dir, self.work_tree, cmd)
         else:
             git_cmd = 'git {}'.format(cmd)
 
-        self.commands.append(git_cmd)
+        self.commands.append(RemoteCommand(git_cmd, ignore_fail=ignore_fail))
 
-    def sh(self, cmd):
-        self.commands.append(cmd)
+    def sh(self, cmd, ignore_fail=False):
+        self.commands.append(RemoteCommand(cmd, ignore_fail=ignore_fail))
 
     def execute(self):
         with tempfile.NamedTemporaryFile() as script:
             script.write('set -e\n')
             for cmd in self.commands:
-                script.write('echo "{}"\n'.format(cmd))
-                script.write(cmd + '\n')
+                script.write('echo {}\n'.format(cmd))
+                if cmd.ignore_fail:
+                    script.write('if ! {}; then echo ignored fail; fi\n'.format(cmd))
+                else:
+                    script.write(str(cmd) + '\n')
+
+
             script.file.flush()
             remote_script = os.path.join(self.__root, '{}.sh'.format(self.name))
             execute('scp {} {}:{}'.format(script.name, self.server, remote_script))
@@ -270,59 +329,50 @@ def setup_command(args):
     local.git('pull')
     local.execute()
 
+
 # todo hide .git from work copy
 def push_command(args):
     config = get_config(args.profile)
 
     # bring potential conflicts on local side
     remote = RemoteWorkflow(config['remote-server'], config['remote-dir'], args.profile, 'push')
+    remote.git('pull')
     remote.git('add .')
     msg = 'save potentially overwritten changes'
-    remote.git('commit -m "[remote] {}" --allow-empty'.format(get_timestamp_message(msg)))
+    remote.git('commit -m "[remote] {}"'.format(get_timestamp_message(msg)), ignore_fail=True)
     remote.git('push')
     remote.execute()
 
     local = LocalWorkflow(config['local-dir'])
     local.git('add .')
-    local.git('commit -m "[local] {}" --allow-empty'.format(get_timestamp_message(args.message)))
-    local.git('pull')
+    empty_commit = local.git('commit -m "[local] {}"'.format(get_timestamp_message(args.message))).on_fail
+    empty_commit.sh('echo empty commit ignored')
+
+    conflict_resolving = local.git('pull').on_fail
+    conflict_resolving.git('mergetool -t vimdiff3', workdir=config['local-dir'], location=False) # customize diff tools
+
     local.git('push')
     local.execute()
 
     remote.git('pull')
     remote.execute()
 
-"""
-local edit
-remote svn up
-gru pull
-conflicts??? -- make user to resolve it
 
-local edit
-remote svn up
-gru push
-conflicts??? (remote conflicts -- worse)
-
-right way:
-1. local edit
-2. gru push
-3. remote svn up
-4. gru pull
-"""
 def pull_command(args):
     config = get_config(args.profile)
 
     srv, remote_dir = config['remote-server'], config['remote-dir']
     remote = RemoteWorkflow(srv, remote_dir, args.profile, 'pull')
+    remote.git('pull')
     remote.git('add .')
-    remote.git('commit -m "update from {}:{}" --allow-empty'.format(srv, remote_dir))
+    remote.git('commit -m "update from {}:{}"'.format(srv, remote_dir), ignore_fail=True)
     remote.git('push')
     remote.execute()
 
     local = LocalWorkflow(config['local-dir'])
     local.git('add .')
     msg = get_timestamp_message('save potentially overwritten changes')
-    local.git('commit -m "[local] {}" --allow-empty'.format(msg))
+    local.git('commit -m "[local] {}"'.format(msg), ignore_fail=True) # todo make ignore_fail
     local.git('pull')
     local.execute()
 
